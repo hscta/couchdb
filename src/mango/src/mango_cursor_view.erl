@@ -19,6 +19,7 @@
 ]).
 
 -export([
+    view_cb/2,
     handle_message/2,
     handle_all_docs_message/2,
     composite_indexes/2,
@@ -93,13 +94,14 @@ maybe_replace_max_json([H | T] = EndKey) when is_list(EndKey) ->
 maybe_replace_max_json(EndKey) ->
     EndKey.
 
-base_args(#cursor{index = Idx} = Cursor) ->
+base_args(#cursor{index = Idx, selector = Selector} = Cursor) ->
     #mrargs{
         view_type = map,
         reduce = false,
         start_key = mango_idx:start_key(Idx, Cursor#cursor.ranges),
         end_key = mango_idx:end_key(Idx, Cursor#cursor.ranges),
-        include_docs = true
+        include_docs = true,
+        extra = [{callback, ?MODULE, view_cb}, {selector, Selector}]
     }.
 
 
@@ -208,6 +210,54 @@ choose_best_index(_DbName, IndexRanges) ->
     end,
     {SelectedIndex, SelectedIndexRanges, _} = hd(lists:sort(Cmp, IndexRanges)),
     {SelectedIndex, SelectedIndexRanges}.
+
+
+view_cb({meta, Meta}, Acc) ->
+    % Map function starting
+    put(mango_docs_examined, 0),
+    ok = rexi:stream2({meta, Meta}),
+    {ok, Acc};
+view_cb({row, Row}, #mrargs{extra = Options} = Acc) ->
+    try
+        Doc = couch_util:get_value(doc, Row),
+        if Doc /= undefined -> ok; true ->
+            ViewRow = #view_row{
+                id = couch_util:get_value(id, Row),
+                key = couch_util:get_value(key, Row),
+                value = couch_util:get_value(value, Row),
+                doc = couch_util:get_value(doc, Row)
+            },
+            ok = rexi:stream2(ViewRow),
+            put(mango_docs_examined, 0),
+            throw(done)
+        end,
+
+        Selector = couch_util:get_value(selector, Options),
+        case mango_selector:match(Selector, Doc) of
+            true ->
+                ViewRow = #view_row{
+                    id = couch_util:get_value(id, Row),
+                    key = couch_util:get_value(key, Row),
+                    value = get(mango_docs_examined) + 1,
+                    doc = couch_util:get_value(doc, Row)
+                },
+                ok = rexi:stream2(ViewRow),
+                put(mango_docs_examined, 0),
+                throw(done)
+            false ->
+                put(mango_docs_examined, get(mango_docs_examined) + 1),
+                ok
+        end;
+    catch throw:done ->
+        ok
+    end,
+    {ok, Acc}
+view_cb(complete, Acc) ->
+    % Finish view output
+    ok = rexi:stream_last(complete),
+    {ok, Acc};
+view_cb(ok, ddoc_updated) ->
+    rexi:reply({ok, ddoc_updated}).
 
 
 handle_message({meta, _}, Cursor) ->
@@ -333,9 +383,13 @@ apply_opts([{_, _} | Rest], Args) ->
 
 
 doc_member(Db, RowProps, Opts, ExecutionStats) ->
+    Incr = case couch_util:get_value(value, RowProps) of
+        N when is_integer(N) -> N;
+        _ -> 1
+    end,
     case couch_util:get_value(doc, RowProps) of
         {DocProps} ->
-            ExecutionStats1 = mango_execution_stats:incr_docs_examined(ExecutionStats),
+            ExecutionStats1 = mango_execution_stats:incr_docs_examined(ExecutionStats, Incr),
             {ok, {DocProps}, {execution_stats, ExecutionStats1}};
         undefined ->
             ExecutionStats1 = mango_execution_stats:incr_quorum_docs_examined(ExecutionStats),
