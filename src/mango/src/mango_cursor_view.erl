@@ -29,6 +29,8 @@
 
 -include_lib("couch/include/couch_db.hrl").
 -include_lib("couch_mrview/include/couch_mrview.hrl").
+-include_lib("fabric/include/fabric.hrl").
+
 -include("mango_cursor.hrl").
 -include("mango_idx_view.hrl").
 
@@ -101,7 +103,7 @@ base_args(#cursor{index = Idx, selector = Selector} = Cursor) ->
         start_key = mango_idx:start_key(Idx, Cursor#cursor.ranges),
         end_key = mango_idx:end_key(Idx, Cursor#cursor.ranges),
         include_docs = true,
-        extra = [{callback, ?MODULE, view_cb}, {selector, Selector}]
+        extra = [{callback, {?MODULE, view_cb}}, {selector, Selector}]
     }.
 
 
@@ -212,46 +214,42 @@ choose_best_index(_DbName, IndexRanges) ->
     {SelectedIndex, SelectedIndexRanges}.
 
 
+baseViewRow(Row) ->
+    #view_row{
+        id = couch_util:get_value(id, Row),
+        key = couch_util:get_value(key, Row),
+        doc = couch_util:get_value(doc, Row)
+    }.
+
+
 view_cb({meta, Meta}, Acc) ->
     % Map function starting
     put(mango_docs_examined, 0),
     ok = rexi:stream2({meta, Meta}),
     {ok, Acc};
 view_cb({row, Row}, #mrargs{extra = Options} = Acc) ->
-    try
-        Doc = couch_util:get_value(doc, Row),
-        if Doc /= undefined -> ok; true ->
-            ViewRow = #view_row{
-                id = couch_util:get_value(id, Row),
-                key = couch_util:get_value(key, Row),
-                value = couch_util:get_value(value, Row),
-                doc = couch_util:get_value(doc, Row)
+    ViewRow = baseViewRow(Row),
+    case couch_util:get_value(doc, Row) of
+        undefined ->
+            ViewRow2 = ViewRow#view_row{
+                value = couch_util:get_value(value, Row)
             },
-            ok = rexi:stream2(ViewRow),
-            put(mango_docs_examined, 0),
-            throw(done)
+            ok = rexi:stream2(ViewRow2),
+            put(mango_docs_examined, 0);
+        Doc ->
+            Selector = couch_util:get_value(selector, Options),
+            case mango_selector:match(Selector, Doc) of
+                true ->
+                    ViewRow2 = ViewRow#view_row{
+                        value = get(mango_docs_examined) + 1
+                    },
+                    ok = rexi:stream2(ViewRow2),
+                    put(mango_docs_examined, 0);
+                false ->
+                    put(mango_docs_examined, get(mango_docs_examined) + 1)
+            end
         end,
-
-        Selector = couch_util:get_value(selector, Options),
-        case mango_selector:match(Selector, Doc) of
-            true ->
-                ViewRow = #view_row{
-                    id = couch_util:get_value(id, Row),
-                    key = couch_util:get_value(key, Row),
-                    value = get(mango_docs_examined) + 1,
-                    doc = couch_util:get_value(doc, Row)
-                },
-                ok = rexi:stream2(ViewRow),
-                put(mango_docs_examined, 0),
-                throw(done)
-            false ->
-                put(mango_docs_examined, get(mango_docs_examined) + 1),
-                ok
-        end;
-    catch throw:done ->
-        ok
-    end,
-    {ok, Acc}
+    {ok, Acc};
 view_cb(complete, Acc) ->
     % Finish view output
     ok = rexi:stream_last(complete),
@@ -263,19 +261,19 @@ view_cb(ok, ddoc_updated) ->
 handle_message({meta, _}, Cursor) ->
     {ok, Cursor};
 handle_message({row, Props}, Cursor) ->
-    case doc_member(Cursor#cursor.db, Props, Cursor#cursor.opts, Cursor#cursor.execution_stats) of
+    case doc_member(Cursor, Props) of
         {ok, Doc, {execution_stats, ExecutionStats1}} ->
             Cursor1 = Cursor#cursor {
                 execution_stats = ExecutionStats1
             },
-            case mango_selector:match(Cursor1#cursor.selector, Doc) of
-                true ->
-                    Cursor2 = update_bookmark_keys(Cursor1, Props),
-                    FinalDoc = mango_fields:extract(Doc, Cursor2#cursor.fields),
-                    handle_doc(Cursor2, FinalDoc);
-                false ->
-                    {ok, Cursor1}
-            end;
+            Cursor2 = update_bookmark_keys(Cursor1, Props),
+            FinalDoc = mango_fields:extract(Doc, Cursor2#cursor.fields),
+            handle_doc(Cursor2, FinalDoc);
+        {no_match, _, {execution_stats, ExecutionStats1}} ->
+            Cursor1 = Cursor#cursor {
+                execution_stats = ExecutionStats1
+            },
+            {ok, Cursor1};
         Error ->
             couch_log:error("~s :: Error loading doc: ~p", [?MODULE, Error]),
             {ok, Cursor}
@@ -382,7 +380,11 @@ apply_opts([{_, _} | Rest], Args) ->
     apply_opts(Rest, Args).
 
 
-doc_member(Db, RowProps, Opts, ExecutionStats) ->
+doc_member(Cursor, RowProps) ->
+    Db = Cursor#cursor.db, 
+    Opts = Cursor#cursor.opts,
+    ExecutionStats = Cursor#cursor.execution_stats,
+    Selector = Cursor#cursor.selector,
     Incr = case couch_util:get_value(value, RowProps) of
         N when is_integer(N) -> N;
         _ -> 1
@@ -395,8 +397,14 @@ doc_member(Db, RowProps, Opts, ExecutionStats) ->
             ExecutionStats1 = mango_execution_stats:incr_quorum_docs_examined(ExecutionStats),
             Id = couch_util:get_value(id, RowProps),
             case mango_util:defer(fabric, open_doc, [Db, Id, Opts]) of
-                {ok, #doc{}=Doc} ->
-                    {ok, couch_doc:to_json_obj(Doc, []), {execution_stats, ExecutionStats1}};
+                {ok, #doc{}=DocProps} ->
+                    Doc = couch_doc:to_json_obj(DocProps, []),
+                    case mango_selector:match(Selector, Doc) of
+                        true ->
+                            {ok, Doc, {execution_stats, ExecutionStats1}};
+                        false ->
+                            {no_match, Doc, {execution_stats, ExecutionStats1}}
+                    end;
                 Else ->
                     Else
             end
