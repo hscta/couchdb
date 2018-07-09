@@ -214,22 +214,18 @@ choose_best_index(_DbName, IndexRanges) ->
     {SelectedIndex, SelectedIndexRanges}.
 
 
-baseViewRow(Row) ->
-    #view_row{
-        id = couch_util:get_value(id, Row),
-        key = couch_util:get_value(key, Row),
-        doc = couch_util:get_value(doc, Row)
-    }.
-
-
 view_cb({meta, Meta}, Acc) ->
     % Map function starting
     put(mango_docs_examined, 0),
     ok = rexi:stream2({meta, Meta}),
     {ok, Acc};
 view_cb({row, Row}, #mrargs{extra = Options} = Acc) ->
-    ViewRow = baseViewRow(Row),
-    case couch_util:get_value(doc, Row) of
+    ViewRow =  #view_row{
+        id = couch_util:get_value(id, Row),
+        key = couch_util:get_value(key, Row),
+        doc = couch_util:get_value(doc, Row)
+    },
+    case ViewRow#view_row.doc of
         undefined ->
             ViewRow2 = ViewRow#view_row{
                 value = couch_util:get_value(value, Row)
