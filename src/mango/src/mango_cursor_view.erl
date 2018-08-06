@@ -217,6 +217,7 @@ choose_best_index(_DbName, IndexRanges) ->
 view_cb({meta, Meta}, Acc) ->
     % Map function starting
     put(mango_docs_examined, 0),
+    set_mango_msg_timestamp(),
     ok = rexi:stream2({meta, Meta}),
     {ok, Acc};
 view_cb({row, Row}, #mrargs{extra = Options} = Acc) ->
@@ -231,7 +232,8 @@ view_cb({row, Row}, #mrargs{extra = Options} = Acc) ->
                 value = couch_util:get_value(value, Row)
             },
             ok = rexi:stream2(ViewRow2),
-            put(mango_docs_examined, 0);
+            put(mango_docs_examined, 0),
+            set_mango_msg_timestamp();
         Doc ->
             Selector = couch_util:get_value(selector, Options),
             case mango_selector:match(Selector, Doc) of
@@ -240,9 +242,21 @@ view_cb({row, Row}, #mrargs{extra = Options} = Acc) ->
                         value = get(mango_docs_examined) + 1
                     },
                     ok = rexi:stream2(ViewRow2),
-                    put(mango_docs_examined, 0);
+                    put(mango_docs_examined, 0),
+                    set_mango_msg_timestamp();
                 false ->
-                    put(mango_docs_examined, get(mango_docs_examined) + 1)
+                    put(mango_docs_examined, get(mango_docs_examined) + 1),
+                    Current = erlang:system_time(millisecond),
+                    LastPing = get(mango_last_msg_timestamp),
+                    % Fabric will timeout if it has not heard a response from a worker node
+                    % after 5 seconds. Send a ping every 4 seconds so the timeout doesn't happen.
+                    case Current - LastPing > 4000 of
+                        true ->
+                            rexi:ping(),
+                            set_mango_msg_timestamp();
+                        false ->
+                            ok
+                    end
             end
         end,
     {ok, Acc};
@@ -252,6 +266,10 @@ view_cb(complete, Acc) ->
     {ok, Acc};
 view_cb(ok, ddoc_updated) ->
     rexi:reply({ok, ddoc_updated}).
+
+
+set_mango_msg_timestamp() ->
+    put(mango_last_msg_timestamp, erlang:system_time(millisecond)).
 
 
 handle_message({meta, _}, Cursor) ->
