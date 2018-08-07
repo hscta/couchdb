@@ -246,17 +246,7 @@ view_cb({row, Row}, #mrargs{extra = Options} = Acc) ->
                     set_mango_msg_timestamp();
                 false ->
                     put(mango_docs_examined, get(mango_docs_examined) + 1),
-                    Current = erlang:system_time(millisecond),
-                    LastPing = get(mango_last_msg_timestamp),
-                    % Fabric will timeout if it has not heard a response from a worker node
-                    % after 5 seconds. Send a ping every 4 seconds so the timeout doesn't happen.
-                    case Current - LastPing > 4000 of
-                        true ->
-                            rexi:ping(),
-                            set_mango_msg_timestamp();
-                        false ->
-                            ok
-                    end
+                    maybe_send_mango_ping()
             end
         end,
     {ok, Acc};
@@ -266,6 +256,20 @@ view_cb(complete, Acc) ->
     {ok, Acc};
 view_cb(ok, ddoc_updated) ->
     rexi:reply({ok, ddoc_updated}).
+
+
+maybe_send_mango_ping() ->
+    Current = erlang:system_time(millisecond),
+    LastPing = get(mango_last_msg_timestamp),
+    % Fabric will timeout if it has not heard a response from a worker node
+    % after 5 seconds. Send a ping every 4 seconds so the timeout doesn't happen.
+    case Current - LastPing > 4000 of
+        true ->
+            rexi:ping(),
+            set_mango_msg_timestamp();
+        false ->
+            ok
+    end.
 
 
 set_mango_msg_timestamp() ->
